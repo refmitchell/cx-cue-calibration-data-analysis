@@ -1,0 +1,562 @@
+#!/usr/bin/env python
+
+"""
+mt_experiment
+
+This script is for running the BeetleBot modality transfer
+experiment.
+
+The robot will be initialised with a specific goal direction.  It will
+then wait for the user to press the RETURN key.  The BeetleBot will
+then perform an orientation dance and travel for 35cm (displacement)
+which should reach approximately the experimental edge where the exit
+angle can be taken.
+
+"""
+
+import rospy
+import rosbag
+import sys
+import os
+import shutil
+import time
+import threading
+
+from bb_util.msg import cue_msg
+from bb_util.msg import erm_status
+from bb_util.msg import ring_mapping
+from bb_util.srv import velocity
+
+from extended_ring_model import *
+from dict_key_definitions import *
+
+from nav_msgs.msg import Odometry
+from geometry_msgs.msg import Twist
+from std_msgs.msg import Float64
+from std_msgs.msg import String
+from rospy.numpy_msg import numpy_msg
+
+from tf.transformations import euler_from_quaternion
+
+# Init ring model
+erm = RingModel({"d_w1":0.5, "d_w2":0.5})
+erm.initialise(w1=0, w2=0, velocity=0, use_defaults=False) # Also randomises the weights
+
+# Declare globals
+dance_dir = 1 # (1 for left, -1 for right, alternating can be enabled below)
+angular_velocity = 0
+th_intensity = 0
+th_wind = 0
+w_intensity = 0.5
+w_wind = 0.5
+yaw = 0
+total_displacement_vector = np.array([0,0])
+new_beetle = True
+recording_enabled = False
+orientation_mode = False
+bagfile = None
+
+# Toggle cue inputs in case contrast thresholding is
+# unreliable.
+intensity_input = True
+wind_input = True
+
+odom_info_received = False
+
+context = "stopped"
+
+def efference_av_callback(data):
+    """
+    ROS callback to determine angular velocity from an 
+    'efference copy' (i.e. a copy of the motor command).
+
+    :param data: ROS message [geometry_msgs/Twist]
+    """
+    global angular_velocity
+    angular_velocity = data.angular.z
+
+def odom_callback(msg):
+    """
+    ROS callback for odometry information
+    :param msg: ROS message [nav_msgs/Odometry]
+    """
+    global yaw
+    global total_displacement_vector
+    global odom_info_received
+    x = msg.pose.pose.position.x
+    y = msg.pose.pose.position.y
+    orientation = msg.pose.pose.orientation
+    iterable_orientation = [
+        orientation.x,
+        orientation.y,
+        orientation.z,
+        orientation.w
+    ]
+    _, _, yaw = euler_from_quaternion(iterable_orientation)
+    total_displacement_vector = np.array([x,y])
+    odom_info_received = True
+    
+
+def wind_cue_callback(data):
+    """
+    ROS callback for wind cue information
+    :param data: ROS message [bb_util/cue_msg]
+    """
+    global th_wind
+    global w_wind
+    th_wind = np.degrees(data.theta) 
+    w_wind = 0.5 if data.contrast > 0 else 0
+
+
+def intensity_cue_callback(data):
+    """
+    ROS callback for intensity cue information
+    :param data: ROS mesage [bb_util/cue_msg]
+    """
+    global th_intensity
+    global w_intensity
+    th_intensity = np.degrees(data.theta) 
+    w_intensity = 0.5 if data.contrast > 0.3 else 0
+
+
+def get_erm_status_as_msg():
+    """
+    Extract the ring model status (neural rates and R-> E-PG mappings)
+    and pack these into a message [bb_util/erm_status] for publication.
+    :return: A ROS message [bb_util/erm_status]
+    """
+    msg = erm_status()
+    msg.r1 = erm.r1_rates
+    msg.r2 = erm.r2_rates
+    msg.epg = erm.epg_rates
+    msg.d7 = erm.d7_rates
+    msg.pen = erm.pen_rates
+    msg.peg = erm.peg_rates
+    msg.fc2 = erm.fc2_rates
+    msg.pfl3L = erm.pfl3L_rates
+    msg.pfl3R = erm.pfl3R_rates
+    msg.steering = erm.last_steering_output
+
+    n_r1 = erm.n_r1
+    n_r2 = erm.n_r2
+    n_epg = erm.n_epg
+    len_r1 = n_r1*n_epg
+    len_r2 = n_r2*n_epg
+
+    msg.r1_epg = list(np.reshape(erm.w_r1_epg, (len_r1,)))
+    msg.r2_epg = list(np.reshape(erm.w_r2_epg, (len_r2,)))
+    msg.n_r1 = erm.n_r1
+    msg.n_r2 = erm.n_r2
+    msg.n_epg = erm.n_epg
+    
+    return msg
+
+def print_instructions():
+    """
+    Print usage instructions to the terminal.
+    """
+    global recording_enabled
+    global orientation_mode
+    global intensity_input
+    global wind_input
+    
+    rec_str = "enabled" if recording_enabled else "disabled"
+    orientation_str = "enabled" if orientation_mode else "disabled"
+    intensity_input_str =  "enabled" if intensity_input else "disabled"
+    wind_input_str =  "enabled" if wind_input else "disabled"
+    
+    print("=================================================================")
+    print("This node generates scripted behaviour for the BeetleBot modality")
+    print("transfer experiment. If something goes wrong mid-run, use CTRL-C")
+    print("or CTRL-Z to kill this node and stop the robot. If recording is enabled")
+    print("then the node will output rosbag files in the current directory.")
+    print("")
+    print("Controls:")
+    print("n -> new: new beetle, re-randomise weights and re-choose goal direction")    
+    print("g -> go: dance then move in the goal direction")
+    print("d -> dance: Just dance, no menotaxis")
+    print("m -> move: just move along the goal direction")
+    print("e -> exit: close this node and ensures safe closure of the rosbag recording")
+    print("r -> toggle recording status ({})".format(rec_str))
+    print("o -> toggle orientation mode ({}): the robot will just turn to the goal direction"
+          .format(orientation_str))
+    print("l -> toggle light input ({}): if disabled, light cues are ignored"
+          .format(intensity_input_str))
+    print("w -> toggle wind input ({}): if disabled, wind cues are ignored"
+          .format(wind_input_str))
+    print("=================================================================")
+
+def process_input():
+    """
+    Set operating context based on user input.
+    :return: a string describing the operating context.
+    """
+    global context
+    global new_beetle
+    global recording_enabled
+    global orientation_mode
+    global intensity_input
+    global wind_input
+    global terminal_settings
+
+    while True:
+        print_instructions()
+        inchar = input() #str(getch.getch()) # Blocking call waits for input
+        if inchar == "g":
+            context = "dance"
+        elif inchar == 'm':
+            context = "orientate"
+        elif inchar == "n":
+            print("New beetle; new recording will begin on next movement")
+            new_beetle = True
+            reset_model()
+            context =  "stopped"
+        elif inchar == "r":
+            recording_enabled = not recording_enabled
+            close_rosbag()
+            context =  "stopped"
+        elif inchar == "d":
+            context =  "just_dance"
+        elif inchar == "o":
+            orientation_mode = not orientation_mode
+            context =  "stopped"
+        elif inchar == "l":
+            intensity_input = not intensity_input
+            context =  "stopped"
+        elif inchar == "w":
+            wind_input = not wind_input
+            context =  "stopped"          
+        elif inchar == "e":
+            print("Exiting...")
+            context = "stopped" # Stop sending messages
+            time.sleep(1)
+            close_rosbag()
+            sys.exit(0)
+        elif inchar == "s":
+            context = "stopped"
+
+        time.sleep(1)
+        print(context)
+
+def model_update_wrapper(loop_hz):
+    """
+    Wrapper function for RingModel.update_state() which
+    saves space in the main loop. Relies heavily on 
+    global variables set by callback functions.
+
+    If recording is enabled, this function will also record the model
+    state.
+
+    :param loop_hz: The ROS rate of the main loop.
+    :return: The model state as a ROS message [bb_util/erm_status]
+    """
+    global angular_velocity
+    global w_intensity
+    global w_wind
+    global th_wind
+    global th_intensity
+    global erm
+    global bagfile
+    global intensity_input
+    global wind_input
+    global context
+    
+    # Convert Rad/s to Deg/s then scale for loop rate.
+    av = -(np.degrees(angular_velocity)) / loop_hz
+
+    # Create a local intensity weight variable which is set only if
+    # lights_out_mode is disabled. Otherwise intensity should be given
+    # zero weight.
+    lw_intensity = w_intensity if intensity_input else 0
+    lw_wind = w_wind if wind_input else 0          
+
+    # Weight normalisation
+    try:
+        lw_intensity = lw_intensity / (lw_intensity + lw_wind)
+        lw_wind = 1 - lw_intensity
+    except ZeroDivisionError as z:
+        lw_intensity = 0
+        lw_wind = 0 
+
+    erm.update_state(th_intensity,
+                     th_wind,
+                     av,
+                     w1=lw_intensity,
+                     w2=lw_wind,
+                     av_plasticity=True,
+    )
+
+    model_state_msg = get_erm_status_as_msg()
+
+    # Write the current state message to the active
+    # bagfile.
+    if recording_enabled:
+        bagfile.write('erm_status', model_state_msg)
+
+        av_msg = Float64()
+        av_msg.data = angular_velocity
+        bagfile.write('angular_velocity', av_msg)
+
+        context_msg = String()
+        context_msg.data = context
+        bagfile.write('context', context_msg)
+
+    return model_state_msg
+
+def reset_model():
+    """
+    Create a new RingModel object, initialise it, and
+    randomise the weights.
+    """
+    global erm
+    # Used during the tent experiments
+    # erm = RingModel()
+    # erm.initialise(w1=0, w2=0, velocity=0) # Also randomises the weights
+
+    # Alternative initialisation. d_wX allows you to set a default weight for each
+    # cue used only if use_defaults is set to true at initialiastion.
+    erm = RingModel({"d_w1":0.5, "d_w2":0.5})
+    erm.initialise(w1=0, w2=0, velocity=0, use_defaults=False) # Also randomises the weights    
+
+def new_rosbag():
+    """
+    Create new rosbag file with the name 'beetle_x.bag' where x is the number
+    of this beetle. If there is already a file named (e.g.) beetle_0.bag then
+    we should automatically create beetle_01.bag rather than overwriting the 
+    data.
+    """
+    global bagfile
+
+    if bagfile != None:
+        bagfile.close()
+
+    num = 1
+    filename = 'beetle_{:03d}.bag'.format(num)
+    entries = os.listdir()
+
+    # Extract only bagfiles, remove .bag extension
+    bagfiles = [x.split(".")[0] for x in entries if '.bag' in x]
+
+    # Extract only files which match out beetle
+    beetleIDs = [x.split("_")[1] for x in bagfiles if 'beetle_' in x]
+
+    if beetleIDs != []:
+        # Find current max
+        try:
+            maxID = max([int(x) for x in beetleIDs])
+            num = maxID + 1
+            filename = 'beetle_{:03d}.bag'.format(num)
+        except ValueError as ve:
+            print("There is a file in the directory called beetle_x.bag")
+            print("where x is not interpretable as an integer. Recording")
+            print("directory state is unknown. Clean up the recording directory")
+            print("or use a new directory. Exiting to avoid data loss.")
+            sys.exit(0)
+
+    # Initialise new bagfile
+    bagfile = rosbag.Bag(filename, 'w')
+    print("New rosbag file: {}".format(filename))
+    
+def close_rosbag():
+    """
+    Close an open bagfile (called only when recording is disabled when the software
+    is live).
+    """
+    global bagfile
+
+    if bagfile != None:
+        bagfile.close()
+        bagfile = None
+
+def node():
+    """
+    Node main routine
+    """
+    global yaw
+    global total_displacement_vector
+    global new_beetle
+    global odom_info_received
+    global context
+    global dance_dir
+    
+    rospy.init_node("erm_node")
+
+    # Rospy subscribers are implicitly started in their own threads
+    rospy.Subscriber("cmd_vel", Twist,  efference_av_callback)
+    rospy.Subscriber("wind_cue", cue_msg, wind_cue_callback)
+    rospy.Subscriber("intensity_cue", cue_msg, intensity_cue_callback)
+    rospy.Subscriber("odom", Odometry, odom_callback)
+
+    pub = rospy.Publisher("erm_status", numpy_msg(erm_status), queue_size=10)
+
+    cmd_vel_service = rospy.ServiceProxy('update_velocity', velocity)
+
+    # Goal direction w.r.t. E-PG preferences
+    goal_direction = 0 # np.random.uniform(-np.pi, np.pi)
+    distance_travelled = 0
+    arena_radius = 0.8
+    
+    loop_hz = 5
+    rosrate = rospy.Rate(loop_hz)
+
+    while not rospy.is_shutdown():
+        if context == "dance" or context == "just_dance":
+            # Wait until we have new odometry information
+            while not odom_info_received:
+                print("waiting for odom")
+                rosrate.sleep()
+
+            traverse = 0 # Total distance covered.
+            y_traverse = 0
+            
+
+            # Update ring model and take initial position
+            msg = model_update_wrapper(loop_hz)
+            pub.publish(msg)
+
+            previous_epg = erm.decode()["epg"][0]
+            previous = yaw
+                    
+            print("Dancing...")
+
+            wait_time = 5
+            start_time = time.time()
+            while True:
+                # Loop end condition, done here so as to avoid
+                # sleeping for 10ms before checking the condition at
+                # the start of the loop.
+                if y_traverse >= 2*np.pi:
+                    context = "orientate" if context == "dance" else "stopped"
+                    break
+
+                current = yaw
+                current_epg = erm.decode()["epg"][0] # Read current EPG angle
+    
+                current_vec = np.array([np.cos(current), np.sin(current)])
+                previous_vec = np.array([np.cos(previous), np.sin(previous)])
+                dot = np.clip(-1,1,np.dot(current_vec, previous_vec))
+                inner_angle = np.arccos(dot)
+                y_traverse += inner_angle
+
+                previous_vec = np.array([np.cos(previous_epg), np.sin(previous_epg)])
+                current_vec = np.array([np.cos(current_epg), np.sin(current_epg)])
+                x_proj = current_vec[0]*previous_vec[0] + current_vec[1]*previous_vec[1]
+                y_proj = -current_vec[0]*previous_vec[1] + current_vec[1]*previous_vec[0]
+                signed_angular_change = -np.arctan2(y_proj, x_proj)
+
+                # Work out amount traversed since previous reading
+                traverse += signed_angular_change
+                print("Y, E: {},{}".format(y_traverse, traverse))
+
+                angular = 0.3*dance_dir
+                if (time.time() - start_time) < wait_time:
+                    angular = 0
+                
+                cmd_vel_service(0, angular, 0)
+                previous_epg = current_epg
+                previous = current
+
+                # Update the ring model (see wrapper function)
+                msg = model_update_wrapper(loop_hz)
+                pub.publish(msg)
+                
+
+
+                rosrate.sleep()
+
+            #dance_dir *= -1 # Alternate dance direction
+            cmd_vel_service(0, 0, 0) # All stop
+            print("Dance complete")
+        elif context == "orientate":
+            # Local displacement vector
+            rosrate.sleep()
+            previous_displacement = total_displacement_vector
+            local_displacement_vector = np.array([0.0,0.0])
+            start_time = time.time()
+            last_error = 0
+            error_i = 0
+            print("Moving...")
+            while True:
+                # Update model and generate steering command
+                msg = model_update_wrapper(loop_hz)
+                pub.publish(msg)
+                bio=True
+                error = erm.steering(goal_direction, bio=bio)
+                duration = time.time() - start_time
+                if bio:
+                    error_p = 3*error
+                    error_i += 0.02*error
+                    error_d = 0.1*(error - last_error)
+                    pid = error_p + error_d# + error_i
+                    steering = 0.5*pid # Scale as large inputs affect network stability
+
+
+                    # DEMO velocity
+                    linear = 0.15 if (abs(steering) < 0.05) and not orientation_mode else 0
+
+
+                else:
+                    steering = 1*error
+                    linear = 0.2 if (abs(steering) < 0.2) and not orientation_mode else 0
+                                
+
+                print("{}, {}, E: {}".format(yaw,steering,error))
+                last_error = error
+
+                # Send movement command
+                cmd_vel_service(linear, steering, 0)
+                msg = get_erm_status_as_msg()
+                pub.publish(msg)
+                      
+                local_displacement_step = total_displacement_vector - previous_displacement
+                local_displacement_vector += local_displacement_step
+                magnitude = np.linalg.norm(local_displacement_vector)
+
+                # ROS docs say the x,y,z should be in m so the local displacement
+                # should be also. Want to go only for 35cm as with the beetles.
+
+                if magnitude >= arena_radius:
+                    context = "stopped"
+                    print("Exit complete")
+                    break
+
+                previous_displacement = total_displacement_vector
+
+
+                if orientation_mode and duration > 20:
+                    context="stopped"
+                    print("(orientation mode) Time elapsed")
+                    break
+
+                rosrate.sleep()
+
+            cmd_vel_service(0, 0, 0) # All stop
+
+
+        else:
+            # context == "stopped", wait for input
+
+            # If this is a new beetle, randomise the weights 
+            if new_beetle:
+                goal_direction = np.random.uniform(-np.pi, np.pi)
+                print("New beetle, internal goal {} degrees".format(np.degrees(goal_direction)))
+                new_beetle = False
+                if recording_enabled:
+                    new_rosbag() # Open new rosbag file
+
+            odom_info_received = False
+            msg = model_update_wrapper(loop_hz)
+            pub.publish(msg)
+
+
+        rosrate.sleep()
+
+
+
+if __name__ == "__main__":
+    input_processor = threading.Thread(target=process_input)
+    input_processor.daemon = True    
+    input_processor.start()
+    node()
+
+
